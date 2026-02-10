@@ -4,8 +4,13 @@
 # Paqet Tunnel Manager
 # Version: 3.8
 # Raw packet-level tunneling for bypassing network restrictions
-# GitHub: https://github.com/hanselime/paqet
-# Design and development by: https://github.com/behzadea12 - https://t.me/behzad_developer
+#
+# Project:  Paqet — https://github.com/hanselime/paqet
+# Idea &   Original Manager by behzadea12
+# Design:  https://github.com/behzadea12 | https://t.me/behzad_developer
+#
+# This fork maintained by: ahmadmute
+# https://github.com/ahmadmute/Paqet-Tunnel-Manage_2
 #=================================================
 
 # Colors
@@ -16,6 +21,8 @@ CYAN='\033[0;36m'
 BLUE='\033[0;34m'
 MAGENTA='\033[0;35m'
 WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 # Configuration
@@ -26,6 +33,8 @@ SERVICE_DIR="/etc/systemd/system"
 BIN_DIR="/usr/local/bin"
 INSTALL_DIR="/opt/paqet"
 GITHUB_REPO="hanselime/paqet"
+DASHBOARD_URL="https://raw.githubusercontent.com/ahmadmute/Paqet-Tunnel-Manage_2/main/paqet-dashboard.py"
+DECOY_URL="https://raw.githubusercontent.com/ahmadmute/Paqet-Tunnel-Manage_2/main/paqet-decoy.py"
 SERVICE_NAME="paqet"
 
 # Banner
@@ -42,10 +51,13 @@ show_banner() {
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
     echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
-    echo "║                                 Manager v3.8                 ║"
+    echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
-    echo "║          https://t.me/behzad_developer                       ║"
-    echo "║          https://github.com/behzadea12                       ║"    
+    echo "║          Maintained by: ahmadmute                            ║"
+    echo "║          https://github.com/ahmadmute/Paqet-Tunnel-Manage_2   ║"
+    echo "║                                                              ║"
+    echo "║          Original: https://t.me/behzad_developer              ║"
+    echo "║          https://github.com/behzadea12                       ║"
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -167,6 +179,24 @@ get_network_info() {
     LOCAL_IP="$local_ip"
     GATEWAY_IP="$gateway_ip"
     GATEWAY_MAC="$gateway_mac"
+}
+
+# Check if Paqet binary runs (glibc compatibility)
+check_paqet_glibc() {
+    [ ! -f "$BIN_DIR/paqet" ] && return 0
+    local out
+    out=$("$BIN_DIR/paqet" version 2>&1) || true
+    if echo "$out" | grep -q "GLIBC.*not found"; then
+        print_error "Paqet binary requires a newer glibc (GLIBC_2.32 / 2.34). Your system has an older one."
+        echo ""
+        echo -e "${YELLOW}Solutions:${NC}"
+        echo -e "  1) ${GREEN}Upgrade OS:${NC} Use Ubuntu 22.04+, Debian 12+, or similar (glibc 2.34+)."
+        echo -e "  2) ${GREEN}Build from source:${NC} Install Go, then: git clone https://github.com/${GITHUB_REPO}.git && cd paqet && go build ./cmd/paqet && cp paqet $BIN_DIR/paqet"
+        echo -e "  3) ${GREEN}Use a VPS with newer distro${NC} (e.g. Ubuntu 22.04) and reinstall Paqet there."
+        echo ""
+        return 1
+    fi
+    return 0
 }
 
 # Check port conflict
@@ -378,29 +408,36 @@ install_paqet() {
     if [ -f "$extracted_binary" ]; then
         cp "$extracted_binary" "$BIN_DIR/paqet"
         chmod +x "$BIN_DIR/paqet"
-        print_success "Paqet installed to $BIN_DIR/paqet"
     else
         # Try alternative naming
-        local alt_binary=$(find "$INSTALL_DIR" -name "paqet" -type f | head -1)
+        local alt_binary
+        alt_binary=$(find "$INSTALL_DIR" -name "paqet" -type f | head -1)
         if [ -f "$alt_binary" ]; then
             cp "$alt_binary" "$BIN_DIR/paqet"
             chmod +x "$BIN_DIR/paqet"
-            print_success "Paqet installed to $BIN_DIR/paqet"
         else
             print_error "Binary not found in archive"
             return 1
         fi
     fi
     
+    if ! check_paqet_glibc; then
+        print_warning "Binary was copied to $BIN_DIR/paqet but it will not run until glibc is fixed (see above)."
+        rm -f "/tmp/paqet.tar.gz"
+        return 1
+    fi
+    
+    print_success "Paqet installed to $BIN_DIR/paqet"
     rm -f "/tmp/paqet.tar.gz"
     return 0
 }
 
-# Configure iptables
+# Configure iptables (protocol: tcp or udp)
 configure_iptables() {
     local port="$1"
+    local proto="${2:-tcp}"
     
-    print_step "Configuring iptables for port $port..."
+    print_step "Configuring iptables for port $port ($proto)..."
     
     if ! command -v iptables &> /dev/null; then
         print_warning "iptables not found, skipping"
@@ -408,14 +445,18 @@ configure_iptables() {
     fi
     
     # Remove existing rules
-    iptables -t raw -D PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null || true
-    iptables -t raw -D OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+    iptables -t raw -D PREROUTING -p "$proto" --dport "$port" -j NOTRACK 2>/dev/null || true
+    iptables -t raw -D OUTPUT -p "$proto" --sport "$port" -j NOTRACK 2>/dev/null || true
+    if [ "$proto" = "tcp" ]; then
+        iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+    fi
     
     # Add new rules
-    iptables -t raw -A PREROUTING -p tcp --dport "$port" -j NOTRACK
-    iptables -t raw -A OUTPUT -p tcp --sport "$port" -j NOTRACK
-    iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+    iptables -t raw -A PREROUTING -p "$proto" --dport "$port" -j NOTRACK
+    iptables -t raw -A OUTPUT -p "$proto" --sport "$port" -j NOTRACK
+    if [ "$proto" = "tcp" ]; then
+        iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+    fi
     
     print_success "iptables configured"
 }
@@ -494,7 +535,9 @@ get_kcp_mode_config() {
             case $block_choice in
                 1) block="aes" ;;
                 2) block="aes-128-gcm" ;;
-                3) block="none" ;;
+                3) block="none"
+                    echo -e "${YELLOW}⚠ DPI: Unencrypted traffic is easier to detect. Use aes or aes-128-gcm for stealth.${NC}" >&2
+                    ;;
                 4)
                     read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
                     block="${block:-aes}"
@@ -527,7 +570,9 @@ get_kcp_mode_config() {
             case $block_choice in
                 1) block="aes" ;;
                 2) block="aes-128-gcm" ;;
-                3) block="none" ;;
+                3) block="none"
+                    echo -e "${YELLOW}⚠ DPI: Unencrypted traffic is easier to detect. Use aes or aes-128-gcm for stealth.${NC}" >&2
+                    ;;
                 4)
                     read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
                     block="${block:-aes}"
@@ -560,7 +605,9 @@ get_kcp_mode_config() {
             case $block_choice in
                 1) block="aes" ;;
                 2) block="aes-128-gcm" ;;
-                3) block="none" ;;
+                3) block="none"
+                    echo -e "${YELLOW}⚠ DPI: Unencrypted traffic is easier to detect. Use aes or aes-128-gcm for stealth.${NC}" >&2
+                    ;;
                 4)
                     read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
                     block="${block:-aes}"
@@ -593,7 +640,9 @@ get_kcp_mode_config() {
             case $block_choice in
                 1) block="aes" ;;
                 2) block="aes-128-gcm" ;;
-                3) block="none" ;;
+                3) block="none"
+                    echo -e "${YELLOW}⚠ DPI: Unencrypted traffic is easier to detect. Use aes or aes-128-gcm for stealth.${NC}" >&2
+                    ;;
                 4)
                     read -p "Enter cipher (e.g., aes, aes-128-gcm, none): " block >&2
                     block="${block:-aes}"
@@ -955,9 +1004,10 @@ configure_server() {
             fi
         done <<< "$kcp_output"
         
-        # Get V2Ray ports
+        # Get inbound ports (V2Ray, OpenVPN, L2TP, SSTP, etc.)
         echo ""
-        read -p "V2Ray inbound ports (comma separated) [9090]: " inbound_ports
+        echo -e "${CYAN}Common ports: V2Ray 9090 | OpenVPN 1194 | SSTP 443 | L2TP 1701${NC}"
+        read -p "Inbound ports - V2Ray/OpenVPN/L2TP/SSTP (comma separated) [9090]: " inbound_ports
         inbound_ports="${inbound_ports:-9090}"
         inbound_ports=$(echo "$inbound_ports" | tr -d ' \t' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
         if [ -z "$inbound_ports" ]; then
@@ -1026,7 +1076,7 @@ EOF
             echo ""
             echo -e "  ${YELLOW}Public IP:${NC}    ${CYAN}$public_ip${NC}"
             echo -e "  ${YELLOW}Listen Port:${NC}  ${CYAN}$port${NC}"
-            echo -e "  ${YELLOW}V2Ray Ports:${NC}  ${CYAN}$inbound_ports${NC}"
+            echo -e "  ${YELLOW}Service Ports (V2Ray/OpenVPN/L2TP/SSTP):${NC}  ${CYAN}$inbound_ports${NC}"
             echo -e "  ${YELLOW}Auto Restart:${NC} ${GREEN}Every 15 minutes${NC}"
             echo -e "  ${YELLOW}Conn:${NC}         ${CYAN}$conn${NC}"
             echo ""
@@ -1036,6 +1086,8 @@ EOF
             echo -e "${YELLOW}KCP Configuration:${NC}"
             echo -e "${CYAN}$kcp_config${NC}"
             echo ""
+            echo -e "${DIM}── Anti-DPI: Use aes/aes-128-gcm, avoid none. Port 443/8443 looks like HTTPS. Menu → 9 for more tips.${NC}"
+            echo ""
         else
             print_error "Failed to start service"
             systemctl status "$service_name" --no-pager -l
@@ -1044,6 +1096,37 @@ EOF
         read -p "Press Enter to continue..."
         return 0
     done
+}
+
+# Show Anti-DPI / Stealth tips
+show_antidpi_tips() {
+    show_banner
+    echo -e "${YELLOW}  ▸ Anti-DPI / Stealth Tips (کمتر دیده شدن توسط DPI)${NC}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${CYAN}1. Encryption:${NC} Always use ${GREEN}aes${NC} or ${GREEN}aes-128-gcm${NC}. Do not use ${RED}none${NC} –"
+    echo -e "     unencrypted traffic is easier for DPI to detect."
+    echo ""
+    echo -e "  ${CYAN}2. Port:${NC} Using port ${GREEN}443${NC} or ${GREEN}8443${NC} makes traffic look like HTTPS."
+    echo -e "     (Paqet docs suggest non-standard ports for iptables; 443 may affect"
+    echo -e "     other HTTPS on the server – use a free port like 8443 if needed.)"
+    echo ""
+    echo -e "  ${CYAN}3. Secret key:${NC} Use a long, random key (script-generated is good)."
+    echo -e "     Do not reuse keys or use simple words."
+    echo ""
+    echo -e "  ${CYAN}4. TLS wrapper (advanced):${NC} Run Paqet behind stunnel or nginx stream"
+    echo -e "     with TLS so the outer layer is encrypted HTTPS – DPI only sees TLS."
+    echo ""
+    echo -e "  ${CYAN}5. KCP mode:${NC} ${GREEN}fast${NC} or ${GREEN}fast2${NC} with encryption give a good balance of"
+    echo -e "     speed and less predictable traffic pattern."
+    echo ""
+    echo -e "  ${CYAN}6. VPN service ports (for forward/listen):${NC}"
+    echo -e "     V2Ray ${GREEN}9090${NC} | OpenVPN ${GREEN}1194${NC} | SSTP ${GREEN}443${NC} | L2TP ${GREEN}1701${NC}"
+    echo -e "     L2TP/IPsec also uses UDP 500, 4500 (TCP forward only in this script)."
+    echo ""
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    read -p "  Press Enter to continue..."
 }
 
 # Configure as Client (Iran)
@@ -1131,17 +1214,28 @@ configure_client() {
             fi
         done <<< "$kcp_output"
         
-        # Get forwarding ports
+        # Get forwarding ports (V2Ray, OpenVPN, L2TP, SSTP, etc.)
         echo ""
-        read -p "Ports to forward (comma separated) [9090]: " forward_ports
+        echo -e "${CYAN}Common: V2Ray 9090 | OpenVPN 1194 | SSTP 443 | L2TP 1701 (match server)${NC}"
+        read -p "Ports to forward - V2Ray/OpenVPN/L2TP/SSTP (comma separated) [9090]: " forward_ports
         forward_ports="${forward_ports:-9090}"
         forward_ports=$(echo "$forward_ports" | tr -d ' \t' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
         if [ -z "$forward_ports" ]; then
             forward_ports="9090"
         fi
         
-        # Check port conflicts and validate
+        # Check port conflicts and validate (remove duplicates)
         IFS=',' read -ra ports_array <<< "$forward_ports"
+        local unique_ports=()
+        for port in "${ports_array[@]}"; do
+            port=$(echo "$port" | tr -d ' \t')
+            [ -z "$port" ] && continue
+            if [[ " ${unique_ports[*]} " != *" ${port} "* ]]; then
+                unique_ports+=("$port")
+            fi
+        done
+        ports_array=("${unique_ports[@]}")
+        forward_ports=$(IFS=','; echo "${ports_array[*]}")
         for port in "${ports_array[@]}"; do
             port=$(echo "$port" | tr -d ' \t')
             [ -z "$port" ] && continue
@@ -1165,7 +1259,7 @@ configure_client() {
             fi
         fi
         
-        # Create forward configuration
+        # Create forward configuration (TCP)
         local forward_config=""
         for port in "${ports_array[@]}"; do
             port=$(echo "$port" | tr -d ' ')
@@ -1174,9 +1268,37 @@ configure_client() {
     target: \"127.0.0.1:${port}\"
     protocol: \"tcp\""
             
-            # Configure iptables for each port
-            configure_iptables "$port"
+            configure_iptables "$port" "tcp"
         done
+        
+        # UDP ports (for KCP / V2Ray UDP / etc.)
+        echo ""
+        echo -e "${CYAN}UDP ports (KCP, V2Ray UDP, etc. – comma separated, or Enter to skip):${NC}"
+        read -p "UDP ports: " udp_ports
+        udp_ports=$(echo "$udp_ports" | tr -d ' \t' | sed 's/,,*/,/g' | sed 's/^,//;s/,$//')
+        if [ -n "$udp_ports" ]; then
+            IFS=',' read -ra udp_array <<< "$udp_ports"
+            local udp_unique=()
+            for port in "${udp_array[@]}"; do
+                port=$(echo "$port" | tr -d ' \t')
+                [ -z "$port" ] && continue
+                if [[ " ${udp_unique[*]} " != *" ${port} "* ]]; then
+                    udp_unique+=("$port")
+                fi
+            done
+            for port in "${udp_unique[@]}"; do
+                if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                    print_warning "Invalid UDP port $port, skipping"
+                    continue
+                fi
+                forward_config="${forward_config}
+  - listen: \"0.0.0.0:${port}\"
+    target: \"127.0.0.1:${port}\"
+    protocol: \"udp\""
+                configure_iptables "$port" "udp"
+            done
+            udp_ports_display=$(IFS=,; echo "${udp_unique[*]}")
+        fi
         
         # Create config
         mkdir -p "$CONFIG_DIR"
@@ -1231,16 +1353,20 @@ EOF
             echo ""
             echo -e "  ${YELLOW}This Server:${NC}   ${CYAN}$public_ip${NC}"
             echo -e "  ${YELLOW}Server:${NC}        ${CYAN}$server_ip:$server_port${NC}"
-            echo -e "  ${YELLOW}Forward Ports:${NC} ${CYAN}$forward_ports${NC}"
+            echo -e "  ${YELLOW}Forward Ports TCP (V2Ray/OpenVPN/L2TP/SSTP):${NC} ${CYAN}$forward_ports${NC}"
+            [ -n "${udp_ports_display:-}" ] && echo -e "  ${YELLOW}Forward Ports UDP (KCP/V2Ray UDP):${NC} ${CYAN}$udp_ports_display${NC}"
             echo -e "  ${YELLOW}Auto Restart:${NC}  ${GREEN}Every 15 minutes${NC}"
             echo -e "  ${YELLOW}Conn:${NC}          ${CYAN}$conn${NC}"
             echo ""
             echo -e "${YELLOW}Client Connection:${NC}"
             echo -e "  Connect to: ${CYAN}$public_ip${NC}"
-            echo -e "  Ports:      ${CYAN}$forward_ports${NC}"
+            echo -e "  Ports TCP:  ${CYAN}$forward_ports${NC}"
+            [ -n "${udp_ports_display:-}" ] && echo -e "  Ports UDP:  ${CYAN}$udp_ports_display${NC}"
             echo ""
             echo -e "${YELLOW}KCP Configuration:${NC}"
             echo -e "${CYAN}$kcp_config${NC}"
+            echo ""
+            echo -e "${DIM}── Anti-DPI: Use aes/aes-128-gcm, avoid none. Port 443/8443 looks like HTTPS. Menu → 9 for more tips.${NC}"
             echo ""
         else
             print_error "Failed to start service"
@@ -1275,9 +1401,15 @@ list_services() {
             
             local status=$(systemctl is-active "$service" 2>/dev/null || echo "unknown")
             local type="unknown"
-            local config_file="$CONFIG_DIR/$display_name.yaml"
-            if [ -f "$config_file" ]; then
-                type=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "unknown")
+            if [ "$display_name" = "dashboard" ]; then
+                type="web"
+            elif [ "$display_name" = "decoy" ]; then
+                type="decoy"
+            else
+                local config_file="$CONFIG_DIR/$display_name.yaml"
+                if [ -f "$config_file" ]; then
+                    type=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "unknown")
+                fi
             fi
             
             local cron_info="No"
@@ -1722,35 +1854,338 @@ uninstall_paqet() {
     read -p "Press Enter to continue..."
 }
 
+# Web Dashboard
+run_web_dashboard() {
+    show_banner
+    echo -e "${YELLOW}  ▸ Web Dashboard${NC}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if ! command -v python3 &> /dev/null; then
+        print_error "python3 is required. Install: apt install python3"
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)
+    local dashboard=""
+    for d in "$script_dir" "$INSTALL_DIR" "/opt/paqet" "."; do
+        [ -f "${d}/paqet-dashboard.py" ] && dashboard="${d}/paqet-dashboard.py" && break
+    done
+    
+    if [ -z "$dashboard" ]; then
+        print_step "Dashboard script not found locally. Downloading to /tmp..."
+        if curl -fsSL "$DASHBOARD_URL" -o /tmp/paqet-dashboard.py 2>/dev/null; then
+            dashboard="/tmp/paqet-dashboard.py"
+            print_success "Downloaded paqet-dashboard.py"
+        else
+            print_error "Could not download dashboard. Place paqet-dashboard.py in: $INSTALL_DIR or same dir as this script."
+            print_info "URL: $DASHBOARD_URL"
+            read -p "Press Enter to continue..."
+            return 1
+        fi
+    fi
+    
+    echo ""
+    read -p "Dashboard port [8880]: " port
+    port="${port:-8880}"
+    port=$(echo "$port" | tr -d ' \t')
+    if [ -z "$port" ]; then
+        port="8880"
+    fi
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        print_error "Invalid port. Use 1-65535."
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    if ss -tuln 2>/dev/null | grep -q ":${port} "; then
+        print_warning "Port $port is already in use. Choose another port or stop the other service."
+        read -p "Continue anyway? (y/N): " cont
+        if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+    fi
+    echo ""
+    print_success "Starting Web Dashboard on port $port"
+    echo -e "  ${CYAN}Open in browser:${NC} http://$(get_public_ip 2>/dev/null || echo 'YOUR_SERVER_IP'):$port/login"
+    echo -e "  ${DIM}Login:${NC} any username, password: ${GREEN}paqet${NC} or ${GREEN}admin${NC} (looks like normal site for DPI)"
+    echo ""
+    echo -e "  ${YELLOW}Press Ctrl+C to stop the dashboard.${NC}"
+    echo ""
+    PAQET_CONFIG_DIR="$CONFIG_DIR" python3 "$dashboard" --port "$port" --bind "0.0.0.0"
+    read -p "Press Enter to continue..."
+}
+
+# Decoy website (port 443 - fake site for DPI)
+run_decoy_website() {
+    show_banner
+    echo -e "${YELLOW}  ▸ Decoy Website (port 443)${NC}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${CYAN}Serves a fake corporate/portal page on port 443.${NC}"
+    echo -e "  ${DIM}DPI or scanners see a normal site; no user action needed.${NC}"
+    echo ""
+    
+    if ! command -v python3 &> /dev/null; then
+        print_error "python3 is required. Install: apt install python3"
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)
+    local decoy=""
+    for d in "$script_dir" "$INSTALL_DIR" "/opt/paqet" "."; do
+        [ -f "${d}/paqet-decoy.py" ] && decoy="${d}/paqet-decoy.py" && break
+    done
+    
+    if [ -z "$decoy" ]; then
+        print_step "Decoy script not found. Downloading to /tmp..."
+        if curl -fsSL "$DECOY_URL" -o /tmp/paqet-decoy.py 2>/dev/null; then
+            decoy="/tmp/paqet-decoy.py"
+            print_success "Downloaded paqet-decoy.py"
+        else
+            print_error "Could not download decoy script. Place paqet-decoy.py in: $INSTALL_DIR or same dir as this script."
+            print_info "URL: $DECOY_URL"
+            read -p "Press Enter to continue..."
+            return 1
+        fi
+    fi
+    
+    echo ""
+    read -p "Decoy port [443]: " port
+    port="${port:-443}"
+    port=$(echo "$port" | tr -d ' \t')
+    if [ -z "$port" ]; then
+        port="443"
+    fi
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        print_error "Invalid port. Use 1-65535."
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    if [ "$port" -lt 1024 ] && [ "$(id -u)" -ne 0 ]; then
+        print_error "Port $port requires root. Run script as root."
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    if ss -tuln 2>/dev/null | grep -q ":${port} "; then
+        print_warning "Port $port is already in use."
+        read -p "Continue anyway? (y/N): " cont
+        if [[ ! "$cont" =~ ^[Yy]$ ]]; then
+            return 0
+        fi
+    fi
+    echo ""
+    print_success "Starting decoy website on port $port"
+    echo -e "  ${CYAN}URL:${NC} http://$(get_public_ip 2>/dev/null || echo 'YOUR_SERVER_IP'):$port"
+    echo -e "  ${DIM}Shows fake 'Secure Portal' page. No login required – for DPI decoy only.${NC}"
+    echo ""
+    echo -e "  ${YELLOW}Press Ctrl+C to stop.${NC}"
+    echo ""
+    python3 "$decoy" --port "$port" --bind "0.0.0.0"
+    read -p "Press Enter to continue..."
+}
+
+# Install Web Dashboard as systemd service (always on)
+install_dashboard_service() {
+    show_banner
+    echo -e "${YELLOW}  ▸ Web Dashboard as service (always on)${NC}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if ! command -v python3 &> /dev/null; then
+        print_error "python3 is required. Install: apt install python3"
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)
+    local dashboard=""
+    for d in "$script_dir" "$INSTALL_DIR" "/opt/paqet" "."; do
+        [ -f "${d}/paqet-dashboard.py" ] && dashboard="${d}/paqet-dashboard.py" && break
+    done
+    
+    if [ -z "$dashboard" ]; then
+        print_step "Downloading paqet-dashboard.py..."
+        mkdir -p "$INSTALL_DIR"
+        if curl -fsSL "$DASHBOARD_URL" -o "$INSTALL_DIR/paqet-dashboard.py" 2>/dev/null; then
+            dashboard="$INSTALL_DIR/paqet-dashboard.py"
+            print_success "Downloaded to $INSTALL_DIR"
+        else
+            print_error "Could not download. Place paqet-dashboard.py in $INSTALL_DIR"
+            read -p "Press Enter to continue..."
+            return 1
+        fi
+    else
+        mkdir -p "$INSTALL_DIR"
+        cp "$dashboard" "$INSTALL_DIR/paqet-dashboard.py" 2>/dev/null && dashboard="$INSTALL_DIR/paqet-dashboard.py"
+    fi
+    
+    echo ""
+    read -p "Dashboard port [8880]: " port
+    port="${port:-8880}"
+    port=$(echo "$port" | tr -d ' \t')
+    [ -z "$port" ] && port="8880"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        print_error "Invalid port. Using 8880."
+        port="8880"
+    fi
+    
+    local python_path
+    python_path=$(command -v python3 2>/dev/null || echo "/usr/bin/python3")
+    cat > "$SERVICE_DIR/paqet-dashboard.service" << EOF
+[Unit]
+Description=Paqet Web Dashboard (always on)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$python_path $INSTALL_DIR/paqet-dashboard.py --port $port --bind 0.0.0.0
+Environment=PAQET_CONFIG_DIR=$CONFIG_DIR
+Restart=always
+RestartSec=5
+WorkingDirectory=$INSTALL_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable paqet-dashboard.service --now
+    if systemctl is-active --quiet paqet-dashboard.service; then
+        print_success "Web Dashboard is now always on"
+        echo ""
+        echo -e "  ${CYAN}URL:${NC} http://$(get_public_ip 2>/dev/null || echo 'YOUR_SERVER_IP'):$port/login"
+        echo -e "  ${DIM}Login:${NC} any user, password: ${GREEN}paqet${NC} or ${GREEN}admin${NC}"
+        echo ""
+        echo -e "  ${YELLOW}To stop/restart:${NC} Menu → Option 5 (Manage Service) → paqet-dashboard"
+    else
+        print_error "Failed to start. Check: systemctl status paqet-dashboard"
+    fi
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
+# Install Decoy website as systemd service (always on)
+install_decoy_service() {
+    show_banner
+    echo -e "${YELLOW}  ▸ Decoy website as service (always on)${NC}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    if ! command -v python3 &> /dev/null; then
+        print_error "python3 is required."
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)
+    local decoy=""
+    for d in "$script_dir" "$INSTALL_DIR" "/opt/paqet" "."; do
+        [ -f "${d}/paqet-decoy.py" ] && decoy="${d}/paqet-decoy.py" && break
+    done
+    
+    if [ -z "$decoy" ]; then
+        mkdir -p "$INSTALL_DIR"
+        if curl -fsSL "$DECOY_URL" -o "$INSTALL_DIR/paqet-decoy.py" 2>/dev/null; then
+            decoy="$INSTALL_DIR/paqet-decoy.py"
+            print_success "Downloaded paqet-decoy.py"
+        else
+            print_error "Could not download. Place paqet-decoy.py in $INSTALL_DIR"
+            read -p "Press Enter to continue..."
+            return 1
+        fi
+    else
+        mkdir -p "$INSTALL_DIR"
+        cp "$decoy" "$INSTALL_DIR/paqet-decoy.py" 2>/dev/null && decoy="$INSTALL_DIR/paqet-decoy.py"
+    fi
+    
+    echo ""
+    read -p "Decoy port [443]: " port
+    port="${port:-443}"
+    port=$(echo "$port" | tr -d ' \t')
+    [ -z "$port" ] && port="443"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        port="443"
+    fi
+    if [ "$port" -lt 1024 ] && [ "$(id -u)" -ne 0 ]; then
+        print_error "Port $port requires root."
+        read -p "Press Enter to continue..."
+        return 1
+    fi
+    
+    local python_path
+    python_path=$(command -v python3 2>/dev/null || echo "/usr/bin/python3")
+    cat > "$SERVICE_DIR/paqet-decoy.service" << EOF
+[Unit]
+Description=Paqet Decoy Website (port $port)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$python_path $INSTALL_DIR/paqet-decoy.py --port $port --bind 0.0.0.0
+Restart=always
+RestartSec=5
+WorkingDirectory=$INSTALL_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable paqet-decoy.service --now
+    if systemctl is-active --quiet paqet-decoy.service; then
+        print_success "Decoy website is now always on"
+        echo ""
+        echo -e "  ${CYAN}URL:${NC} http://$(get_public_ip 2>/dev/null || echo 'YOUR_SERVER_IP'):$port"
+        echo -e "  ${YELLOW}To stop/restart:${NC} Menu → Option 5 (Manage Service) → paqet-decoy"
+    else
+        print_error "Failed to start. Check: systemctl status paqet-decoy"
+    fi
+    echo ""
+    read -p "Press Enter to continue..."
+}
+
 # Main menu
 main_menu() {
     while true; do
         show_banner
         
-        echo -e "${YELLOW}Main Menu${NC}"
+        echo -e "  ${BOLD}${WHITE}▸ Main Menu${NC}"
+        echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
         echo ""
         
         # Check if Paqet is installed
         if [ -f "$BIN_DIR/paqet" ]; then
-            echo -e "${GREEN}✓ Paqet is installed${NC}"
+            echo -e "  ${GREEN}●${NC} Paqet is installed"
         else
-            echo -e "${YELLOW}⚠ Paqet not installed${NC}"
+            echo -e "  ${YELLOW}●${NC} Paqet not installed"
         fi
-        
         echo ""
-        echo -e "${CYAN}0.${NC} Install Paqet Binary Only"
-        echo -e "${CYAN}1.${NC} Install Dependencies"
-        echo -e "${CYAN}2.${NC} Configure as Server (kharej)"
-        echo -e "${CYAN}3.${NC} Configure as Client (Iran)"
-        echo -e "${CYAN}4.${NC} List Services"
-        echo -e "${CYAN}5.${NC} Manage Service"
-        echo -e "${CYAN}6.${NC} View Configuration"
-        echo -e "${CYAN}7.${NC} Optimize Server"
-        echo -e "${CYAN}8.${NC} Uninstall Paqet"
-        echo -e "${CYAN}9.${NC} Exit"
+        echo -e "  ${CYAN}0.${NC} Install Paqet Binary Only"
+        echo -e "  ${CYAN}1.${NC} Install Dependencies"
+        echo -e "  ${CYAN}2.${NC} Configure as Server (Kharej)"
+        echo -e "  ${CYAN}3.${NC} Configure as Client (Iran)"
+        echo -e "  ${CYAN}4.${NC} List Services"
+        echo -e "  ${CYAN}5.${NC} Manage Service"
+        echo -e "  ${CYAN}6.${NC} View Configuration"
+        echo -e "  ${CYAN}7.${NC} Optimize Server"
+        echo -e "  ${CYAN}8.${NC} Uninstall Paqet"
+        echo -e "  ${CYAN}9.${NC} Anti-DPI / Stealth tips"
+        echo -e "  ${CYAN}10.${NC} Web Dashboard (status, logs, config)"
+        echo -e "  ${CYAN}11.${NC} Decoy website (port 443 – fake site for DPI)"
+        echo -e "  ${CYAN}12.${NC} Web Dashboard as service (always on)"
+        echo -e "  ${CYAN}13.${NC} Decoy website as service (always on)"
+        echo -e "  ${CYAN}14.${NC} Exit"
+        echo ""
+        echo -e "  ${DIM}─────────────────────────────────────────────────────────────${NC}"
         echo ""
         
-        read -p "Select option [0-9]: " choice
+        read -p "  Select option [0-14]: " choice
         
         case $choice in
             0)
@@ -1781,6 +2216,21 @@ main_menu() {
                 uninstall_paqet
                 ;;
             9)
+                show_antidpi_tips
+                ;;
+            10)
+                run_web_dashboard
+                ;;
+            11)
+                run_decoy_website
+                ;;
+            12)
+                install_dashboard_service
+                ;;
+            13)
+                install_decoy_service
+                ;;
+            14)
                 echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
                 ;;
